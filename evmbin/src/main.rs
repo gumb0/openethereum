@@ -106,7 +106,7 @@ fn run_call(args: Args) {
     let expected_return = expected.unwrap().clone();
 
     //let gas = U256::from(::std::usize::MAX);
-    let gas = U256::from(1000000);
+    let gas = U256::from(100000000); // 100 million startgas
 
     let mut params = ActionParams::default();
     params.gas = gas;

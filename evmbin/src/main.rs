@@ -37,8 +37,10 @@
 use std::sync::Arc;
 use std::{fmt, fs};
 use std::path::PathBuf;
+use std::time::{Instant};
 
 use parity_bytes::Bytes;
+use bytes::ToPretty;
 use docopt::Docopt;
 use rustc_hex::FromHex;
 use ethereum_types::{U256, Address};
@@ -47,8 +49,8 @@ use spec;
 use serde::Deserialize;
 use vm::{ActionParams, ActionType};
 
-mod info;
-mod display;
+//mod info;
+//mod display;
 
 use crate::info::{Informant, TxInput};
 
@@ -57,43 +59,19 @@ EVM implementation for OpenEthereum.
   Copyright 2015-2020 Parity Technologies (UK) Ltd.
 
 Usage:
-    openethereum-evm state-test <file> [--chain CHAIN --only NAME --json --std-json --std-dump-json --std-out-only --std-err-only]
-    openethereum-evm stats [options]
-    openethereum-evm stats-jsontests-vm <file>
     openethereum-evm [options]
     openethereum-evm [-h | --help]
 
-Commands:
-    state-test         Run a state test on a provided state test JSON file.
-    stats              Execute EVM runtime code and return the statistics.
-    stats-jsontests-vm Execute standard json-tests on a provided state test JSON
-                       file path, format VMTests, and return timing statistics
-                       in tsv format.
-
 Transaction options:
+    --code-file CODEFILE    Read contract code from file as hex (without 0x).
     --code CODE        Contract code as hex (without 0x).
     --to ADDRESS       Recipient address (without 0x).
     --from ADDRESS     Sender address (without 0x).
     --input DATA       Input data as hex (without 0x).
+    --expected DATA    Expected return data as hex (without 0x).
     --gas GAS          Supplied gas as hex (without 0x).
     --gas-price WEI    Supplied gas price as hex (without 0x).
 
-State test options:
-    --chain CHAIN      Run only from specific chain name (i.e. one of EIP150, EIP158,
-                       Frontier, Homestead, Byzantium, Constantinople,
-                       ConstantinopleFix, Istanbul, EIP158ToByzantiumAt5, FrontierToHomesteadAt5,
-                       HomesteadToDaoAt5, HomesteadToEIP150At5, ByzantiumToConstantinopleFixAt5 ,
-                       ConstantinopleFixToIstanbulAt5).
-    --only NAME        Runs only a single test matching the name.
-
-General options:
-    --chain PATH       Path to chain spec file.
-    --json             Display verbose results in JSON.
-    --std-json         Display results in standardized JSON format.
-    --std-dump-json    Display results in standardized JSON format
-                       with additional state dump.
-    --std-err-only     With --std-json redirect to err output only.
-    --std-out-only     With --std-json redirect to out output only.
     -h, --help         Display this message and exit.
 "#;
 
@@ -103,256 +81,93 @@ fn main() {
 
 	let args: Args = Docopt::new(USAGE).and_then(|d| d.deserialize()).unwrap_or_else(|e| e.exit());
 
-	if args.cmd_state_test {
-		run_state_test(args)
-	} else if args.cmd_stats_jsontests_vm {
-		run_stats_jsontests_vm(args)
-	} else if args.flag_json {
-		run_call(args, display::json::Informant::default())
-	} else if args.flag_std_dump_json || args.flag_std_json {
-		if args.flag_std_err_only {
-			run_call(args, display::std_json::Informant::err_only())
-		} else if args.flag_std_out_only {
-			run_call(args, display::std_json::Informant::out_only())
-		} else {
-			run_call(args, display::std_json::Informant::default())
-		};
-	} else {
-		run_call(args, display::simple::Informant::default())
-	}
+	run_call(args)
 }
 
-fn run_state_test(args: Args) {
-	use ethjson::test_helpers::state::Test;
-
-	// Parse the specified state test JSON file provided to the command `state-test <file>`.
-	let file = args.arg_file.expect("PATH to a state test JSON file is required");
-	let mut file = match fs::File::open(&file) {
-		Err(err) => die(format!("Unable to open path: {:?}: {}", file, err)),
-		Ok(file) => file,
-	};
-	let state_test = match Test::load(&mut file) {
-		Err(err) => die(format!("Unable to load the test file: {}", err)),
-		Ok(test) => test,
-	};
-	// Parse the name CLI option `--only NAME`.
-	let only_test = args.flag_only.map(|s| s.to_lowercase());
-	// Parse the chain `--chain CHAIN`
-	let only_chain = args.flag_chain.map(|s| s.to_lowercase());
-
-	// Iterate over 1st level (outer) key-value pair of the state test JSON file.
-	// Skip to next iteration if CLI option `--only NAME` was parsed into `only_test` and does not match
-	// the current key `state_test_name` (i.e. add11, create2callPrecompiles).
-	for (state_test_name, test) in state_test {
-		if let Some(false) = only_test.as_ref().map(|only_test| {
-			&state_test_name.to_lowercase() == only_test
-		}) {
-			continue;
-		}
-
-		// Assign from 2nd level key-value pairs of the state test JSON file (i.e. env, post, pre, transaction).
-		let multitransaction = test.transaction;
-		let env_info = test.env.into();
-		let pre = test.pre_state.into();
-
-		// Iterate over remaining "post" key of the 2nd level key-value pairs in the state test JSON file.
-		// Skip to next iteration if CLI option `--chain CHAIN` was parsed into `only_chain` and does not match
-		// the current key `fork_spec_name` (i.e. Constantinople, EIP150, EIP158).
-		for (fork_spec_name, states) in test.post_states {
-			if let Some(false) = only_chain.as_ref().map(|only_chain| {
-				&format!("{:?}", fork_spec_name).to_lowercase() == only_chain
-			}) {
-				continue;
-			}
-
-			// Iterate over the 3rd level key-value pairs of the state test JSON file
-			// (i.e. list of transactions and associated state roots hashes corresponding each chain).
-			for (tx_index, state) in states.into_iter().enumerate() {
-				let post_root = state.hash.into();
-				let transaction = multitransaction.select(&state.indexes).into();
-
-				// Determine the type of trie with state root to create in the database.
-				// The database is a key-value datastore implemented as a database-backend
-				// modified Merkle tree.
-				// Use a secure trie database specification when CLI option `--std-dump-json`
-				// is specified, otherwise use secure trie with fat trie database.
-				let trie_spec = if args.flag_std_dump_json {
-					TrieSpec::Fat
-				} else {
-					TrieSpec::Secure
-				};
-
-				// Execute the given transaction and verify resulting state root
-				// for CLI option `--std-dump-json` or `--std-json`.
-				if args.flag_std_dump_json || args.flag_std_json {
-					if args.flag_std_err_only {
-						let tx_input = TxInput {
-							state_test_name: &state_test_name,
-							tx_index,
-							fork_spec_name: &fork_spec_name,
-							pre_state: &pre,
-							post_root,
-							env_info: &env_info,
-							transaction,
-							informant: display::std_json::Informant::err_only(),
-							trie_spec,
-						};
-						// Use Standard JSON informant with err only
-						info::run_transaction(tx_input);
-					} else if args.flag_std_out_only {
-						let tx_input = TxInput {
-							state_test_name: &state_test_name,
-							tx_index,
-							fork_spec_name: &fork_spec_name,
-							pre_state: &pre,
-							post_root,
-							env_info: &env_info,
-							transaction,
-							informant: display::std_json::Informant::out_only(),
-							trie_spec,
-						};
-						// Use Standard JSON informant with out only
-						info::run_transaction(tx_input);
-					} else {
-						let tx_input = TxInput {
-							state_test_name: &state_test_name,
-							tx_index,
-							fork_spec_name: &fork_spec_name,
-							pre_state: &pre,
-							post_root,
-							env_info: &env_info,
-							transaction,
-							informant: display::std_json::Informant::default(),
-							trie_spec,
-						};
-						// Use Standard JSON informant default
-						info::run_transaction(tx_input);
-					}
-				} else {
-					// Execute the given transaction and verify resulting state root
-					// for CLI option `--json`.
-					if args.flag_json {
-						let tx_input = TxInput {
-							state_test_name: &state_test_name,
-							tx_index,
-							fork_spec_name: &fork_spec_name,
-							pre_state: &pre,
-							post_root,
-							env_info: &env_info,
-							transaction,
-							informant: display::json::Informant::default(),
-							trie_spec,
-						};
-						// Use JSON informant
-						info::run_transaction(tx_input);
-					} else {
-						let tx_input = TxInput {
-							state_test_name: &state_test_name,
-							tx_index,
-							fork_spec_name: &fork_spec_name,
-							pre_state: &pre,
-							post_root,
-							env_info: &env_info,
-							transaction,
-							informant: display::simple::Informant::default(),
-							trie_spec,
-						};
-						// Use Simple informant
-						info::run_transaction(tx_input);
-					}
-				}
-			}
-		}
-	}
-}
-
-fn run_stats_jsontests_vm(args: Args) {
-	use crate::json_tests::HookType;
-	use std::collections::HashMap;
-	use std::time::{Instant, Duration};
-
-	let file = args.arg_file.expect("PATH to a state test JSON file is required");
-
-	let mut timings: HashMap<String, (Instant, Option<Duration>)> = HashMap::new();
-
-	{
-		let mut record_time = |name: &str, typ: HookType| {
-			match typ {
-				HookType::OnStart => {
-					timings.insert(name.to_string(), (Instant::now(), None));
-				},
-				HookType::OnStop => {
-					timings.entry(name.to_string()).and_modify(|v| {
-						v.1 = Some(v.0.elapsed());
-					});
-				},
-			}
-		};
-		if !file.is_file() {
-			json_tests::run_executive_test_path(&file, &[], &mut record_time);
-		} else {
-			json_tests::run_executive_test_file(&file, &mut record_time);
-		}
-	}
-
-	for (name, v) in timings {
-		println!("{}\t{}", name, display::as_micros(&v.1.expect("All hooks are called with OnStop; qed")));
-	}
-}
-
-// CLI command `stats`
-fn run_call<T: Informant>(args: Args, informant: T) {
+fn run_call(args: Args) {
+	let _from = arg(args.from(), "--from");
+	let _to = arg(args.to(), "--to");
+	let code_file = arg(args.code_file(), "--code-file");
 	let code = arg(args.code(), "--code");
-	let to = arg(args.to(), "--to");
-	let from = arg(args.from(), "--from");
-	let data = arg(args.data(), "--input");
-	let gas = arg(args.gas(), "--gas");
-	let gas_price = arg(args.gas_price(), "--gas-price");
-	let spec = arg(args.spec(), "--chain");
+	let _gas = arg(args.gas(), "--gas");
+	let _gas_price = arg(args.gas_price(), "--gas-price");
+	let calldata = arg(args.data(), "--input");
+    let expected = arg(args.expected(), "--expected");
 
-	if code.is_none() && to == Address::zero() {
-		die("Either --code or --to is required.");
+	if code.is_none() && code_file.is_none() {
+		die("Either --code or --code-file is required.");
 	}
 
-	let mut params = ActionParams::default();
-	params.action_type = if code.is_none() { ActionType::Call } else { ActionType::Create };
-	params.code = code.map(Arc::new);
-	params.code_address = to;
-	params.address = to;
-	params.sender = from;
-	params.origin = from;
-	params.data = data;
-	params.gas = gas;
-	params.gas_price = gas_price;
+    if expected.is_none() {
+        die("Expected return data --expected is required.");
+    }
 
-	let mut sink = informant.clone_sink();
-	let result = if args.flag_std_dump_json {
-		info::run_action(&spec, params, informant, TrieSpec::Fat)
-	} else {
-		info::run_action(&spec, params, informant, TrieSpec::Secure)
-	};
-	T::finish(result, &mut sink);
+    let code = code_file.unwrap();
+    let expected_return = expected.unwrap().clone();
+
+    //let gas = U256::from(::std::usize::MAX);
+    let gas = U256::from(1000000);
+
+    let mut params = ActionParams::default();
+    params.gas = gas;
+    params.code = Some(Arc::new(code.clone()));
+    params.data = calldata.clone();
+
+    let spec = ethcore::ethereum::new_constantinople_test();
+    let mut test_client = ethcore::client::EvmTestClient::new(&spec).unwrap();
+    let call_result = test_client.call(params, &mut ethcore::trace::NoopTracer, &mut ethcore::trace::NoopVMTracer).unwrap();
+    let return_data = call_result.return_data.to_vec().to_hex();
+    println!("return_data: {:?}", return_data);
+    println!("gas used: {:?}", gas - call_result.gas_left);
+
+    if return_data != expected_return {
+        println!("Wrong return data!  got: {:?}   expected: {:?}", return_data, expected_return);
+        die("wrong return data.");
+    }
+
+
+    let iterations = 100;
+    let mut total_duration = std::time::Duration::new(0, 0);
+
+    for _i in 0..iterations {
+        let mut params = ActionParams::default();
+        params.gas = gas;
+        params.code = Some(Arc::new(code.clone()));
+        params.data = calldata.clone();
+
+        let spec = ethcore::ethereum::new_constantinople_test();
+        let mut test_client = ethcore::client::EvmTestClient::new(&spec).unwrap();
+
+        let start_run = Instant::now();
+
+        let _result = test_client.call(params, &mut ethcore::trace::NoopTracer, &mut ethcore::trace::NoopVMTracer).unwrap();
+
+        let run_duration = start_run.elapsed();
+        total_duration = total_duration + run_duration;
+    }
+
+    let avg_duration = total_duration / iterations;
+    println!("code avg run time: {:?}", avg_duration);
+
 }
+
+
+
 
 #[derive(Debug, Deserialize)]
 struct Args {
-	cmd_stats: bool,
-	cmd_state_test: bool,
-	cmd_stats_jsontests_vm: bool,
-	arg_file: Option<PathBuf>,
+    flag_code_file: Option<String>,
+	flag_only: Option<String>,
+	flag_from: Option<String>,
+	flag_to: Option<String>,
 	flag_code: Option<String>,
 	flag_to: Option<String>,
 	flag_from: Option<String>,
 	flag_input: Option<String>,
 	flag_gas: Option<String>,
 	flag_gas_price: Option<String>,
-	flag_only: Option<String>,
-	flag_chain: Option<String>,
-	flag_json: bool,
-	flag_std_json: bool,
-	flag_std_dump_json: bool,
-	flag_std_err_only: bool,
-	flag_std_out_only: bool,
+	flag_input: Option<String>,
+    flag_expected: Option<String>,
 }
 
 impl Args {
@@ -412,19 +227,24 @@ impl Args {
 		}
 	}
 
-	// CLI option `--chain PATH`
-	/// Set the path of the chain specification JSON file.
-	pub fn spec(&self) -> Result<spec::Spec, String> {
-		Ok(match self.flag_chain {
-			Some(ref filename) => {
-				let file = fs::File::open(filename).map_err(|e| e.to_string())?;
-				spec::Spec::load(&::std::env::temp_dir(), file).map_err(|e| e.to_string())?
-			},
-			None => {
-				spec::new_foundation(&::std::env::temp_dir())
-			},
-		})
+	pub fn expected(&self) -> Result<Option<String>, String> {
+		match self.flag_expected {
+			Some(ref expected) => expected.parse().map_err(to_string).map(Some),
+			None => Ok(None),
+		}
 	}
+
+    pub fn code_file(&self) -> Result<Option<Bytes>, String> {
+        match self.flag_code_file {
+            Some(ref filename) => {
+                let code_hex = fs::read_to_string(filename).unwrap();
+                println!("code_hex length: {:?}", code_hex.len());
+                code_hex.from_hex().map_err(to_string).map(Some)
+            },
+            None => Ok(None),
+        }
+    }
+
 }
 
 fn arg<T>(v: Result<T, String>, param: &str) -> T {
@@ -473,203 +293,21 @@ mod tests {
 	#[test]
 	fn should_parse_all_the_options() {
 		let args = run(&[
-			"openethereum-evm",
-			"--code", "05",
-			"--to", "0000000000000000000000000000000000000004",
-			"--from", "0000000000000000000000000000000000000003",
-			"--input", "06",
+			"parity-evm",
 			"--gas", "1",
 			"--gas-price", "2",
-			"--chain", "./testfile.json",
-			"--json",
-			"--std-json",
-			"--std-dump-json",
-			"--std-err-only",
-			"--std-out-only",
+			"--from", "0000000000000000000000000000000000000003",
+			"--to", "0000000000000000000000000000000000000004",
+			"--code", "05",
+			"--input", "06",
 		]);
 
-		assert_eq!(args.code(), Ok(Some(vec![05])));
-		assert_eq!(args.to(), Ok(Address::from_low_u64_be(4)));
-		assert_eq!(args.from(), Ok(Address::from_low_u64_be(3)));
-		assert_eq!(args.data(), Ok(Some(vec![06]))); // input data
 		assert_eq!(args.gas(), Ok(1.into()));
 		assert_eq!(args.gas_price(), Ok(2.into()));
-		assert_eq!(args.flag_chain, Some("./testfile.json".to_owned()));
-		assert_eq!(args.flag_json, true);
-		assert_eq!(args.flag_std_json, true);
-		assert_eq!(args.flag_std_dump_json, true);
-		assert_eq!(args.flag_std_err_only, true);
-		assert_eq!(args.flag_std_out_only, true);
+		assert_eq!(args.from(), Ok(3.into()));
+		assert_eq!(args.to(), Ok(4.into()));
+		assert_eq!(args.code(), Ok(Some(vec![05])));
+		assert_eq!(args.data(), Ok(Some(vec![06])));
 	}
 
-	#[test]
-	fn should_parse_state_test_command() {
-		let args = run(&[
-			"openethereum-evm",
-			"state-test",
-			"./file.json",
-			"--chain", "homestead",
-			"--only=add11",
-			"--json",
-			"--std-json",
-			"--std-dump-json",
-			"--std-out-only",
-			"--std-err-only",
-		]);
-
-		assert_eq!(args.cmd_state_test, true);
-		assert!(args.arg_file.is_some());
-		assert_eq!(args.flag_chain, Some("homestead".to_owned()));
-		assert_eq!(args.flag_only, Some("add11".to_owned()));
-		assert_eq!(args.flag_json, true);
-		assert_eq!(args.flag_std_json, true);
-		assert_eq!(args.flag_std_dump_json, true);
-		assert_eq!(args.flag_std_out_only, true);
-		assert_eq!(args.flag_std_err_only, true);
-	}
-
-	#[test]
-	#[should_panic]
-	fn should_not_parse_only_flag_without_state_test() {
-		let _ = run(&[
-			"openethereum-evm",
-			"./file.json",
-			"--chain", "homestead",
-			"--only=add11",
-			"--json",
-		]);
-	}
-
-	#[test]
-	#[should_panic]
-	fn should_not_parse_only_flag_with_stats() {
-		let _ = run(&[
-			"openethereum-evm",
-			"stats",
-			"./file.json",
-			"--chain", "homestead",
-			"--only=add11",
-			"--json",
-		]);
-	}
-
-	#[test]
-	fn should_not_verify_state_root_using_sample_state_test_json_file() {
-		let state_tests = include_str!("../res/teststate.json");
-		// Parse the specified state test JSON file to simulate the CLI command `state-test <file>`.
-		let deserialized_state_tests: SampleStateTests = serde_json::from_str(state_tests)
-			.expect("Serialization cannot fail; qed");
-
-		// Simulate the name CLI option `--only NAME`
-		let state_test_name = "add11";
-		let pre = deserialized_state_tests.add11.pre_state.into();
-		let env_info = deserialized_state_tests.add11.env.into();
-		let multitransaction = deserialized_state_tests.add11.transaction;
-
-		for (fork_spec_name, tx_states) in deserialized_state_tests.add11.post_states.iter() {
-			for (tx_index, tx_state) in tx_states.into_iter().enumerate() {
-				let (informant, _, res) = informant();
-				let trie_spec = TrieSpec::Secure;
-				let transaction: transaction::SignedTransaction = multitransaction.select(&tx_state.indexes).into();
-				let tx_input = TxInput {
-					state_test_name: &state_test_name,
-					tx_index,
-					fork_spec_name: &fork_spec_name,
-					pre_state: &pre,
-					post_root: tx_states[tx_index].hash.0,
-					env_info: &env_info,
-					transaction,
-					informant,
-					trie_spec,
-				};
-				assert!(!info::run_transaction(tx_input));
-				assert!(
-					&String::from_utf8_lossy(&**res.0.lock().unwrap()).contains("State root mismatch")
-				);
-			}
-		}
-	}
-
-	#[test]
-	fn should_verify_state_root_using_constantinople_state_test_json_file() {
-		let state_tests = include_str!("../res/create2callPrecompiles.json");
-		// Parse the specified state test JSON file to simulate the CLI command `state-test <file>`.
-		let deserialized_state_tests: ConstantinopleStateTests = serde_json::from_str(state_tests)
-			.expect("Serialization cannot fail; qed");
-
-		// Simulate the name CLI option `--only NAME`
-		let state_test_name = "create2callPrecompiles";
-		let pre = deserialized_state_tests.create2call_precompiles.pre_state.into();
-		let env_info = deserialized_state_tests.create2call_precompiles.env.into();
-		let multitransaction = deserialized_state_tests.create2call_precompiles.transaction;
-		for (fork_spec_name, tx_states) in deserialized_state_tests.create2call_precompiles.post_states.iter() {
-			for (tx_index, tx_state) in tx_states.into_iter().enumerate() {
-				let (informant, _, _) = informant();
-				let trie_spec = TrieSpec::Secure; // TrieSpec::Fat for --std_dump_json
-				let transaction: transaction::SignedTransaction = multitransaction.select(&tx_state.indexes).into();
-				let tx_input = TxInput {
-					state_test_name: &state_test_name,
-					tx_index,
-					fork_spec_name: &fork_spec_name,
-					pre_state: &pre,
-					post_root: tx_states[tx_index].hash.0,
-					env_info: &env_info,
-					transaction,
-					informant,
-					trie_spec,
-				};
-				assert!(info::run_transaction(tx_input));
-			}
-		}
-	}
-
-	#[test]
-	fn should_error_out_of_gas() {
-		let args = run(&[
-			"openethereum-evm",
-			"stats",
-			"--to", "0000000000000000000000000000000000000004",
-			"--from", "0000000000000000000000000000000000000003",
-			"--code", "05",
-			"--input", "06",
-			"--gas", "1",
-			"--gas-price", "2",
-			"--only=add11",
-			"--std-json",
-			"--std-out-only",
-		]);
-
-		let (inf, _, res) = informant();
-		run_call(args, inf);
-
-		assert!(
-			&String::from_utf8_lossy(&**res.0.lock().unwrap())
-				.starts_with(r#"{"error":"EVM: Out of gas","gasUsed":"0x1","#),
-		);
-	}
-
-	#[test]
-	fn should_not_error_out_of_gas() {
-		let args = run(&[
-			"openethereum-evm",
-			"stats",
-			"--to", "0000000000000000000000000000000000000004",
-			"--from", "0000000000000000000000000000000000000003",
-			"--code", "05",
-			"--input", "06",
-			"--gas", "21",
-			"--gas-price", "2",
-			"--only=add11",
-			"--std-json",
-			"--std-out-only",
-		]);
-
-		let (inf, _, res) = informant();
-		run_call(args, inf);
-
-		assert!(
-			&String::from_utf8_lossy(&**res.0.lock().unwrap())
-				.starts_with(r#"{"output":"0x06","gasUsed":"0x12","#),
-		);
-	}
 }

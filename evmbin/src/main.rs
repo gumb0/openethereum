@@ -40,19 +40,21 @@ use std::path::PathBuf;
 use std::time::{Instant};
 
 use parity_bytes::Bytes;
-use bytes::ToPretty;
+use parity_bytes::ToPretty;
 use docopt::Docopt;
 use rustc_hex::FromHex;
 use ethereum_types::{U256, Address};
 use ethcore::{json_tests, test_helpers::TrieSpec};
+use ethcore::test_helpers::{EvmTestClient};
 use spec;
 use serde::Deserialize;
 use vm::{ActionParams, ActionType};
+use trace;
 
 //mod info;
 //mod display;
 
-use crate::info::{Informant, TxInput};
+//use crate::info::{Informant, TxInput};
 
 const USAGE: &'static str = r#"
 EVM implementation for OpenEthereum.
@@ -113,9 +115,9 @@ fn run_call(args: Args) {
     params.code = Some(Arc::new(code.clone()));
     params.data = calldata.clone();
 
-    let spec = ethcore::ethereum::new_constantinople_test();
-    let mut test_client = ethcore::client::EvmTestClient::new(&spec).unwrap();
-    let call_result = test_client.call(params, &mut ethcore::trace::NoopTracer, &mut ethcore::trace::NoopVMTracer).unwrap();
+    let spec = spec::new_constantinople_test();
+    let mut test_client = EvmTestClient::new(&spec).unwrap();
+    let call_result = test_client.call(params, &mut trace::NoopTracer, &mut trace::NoopVMTracer).unwrap();
     let return_data = call_result.return_data.to_vec().to_hex();
     println!("return_data: {:?}", return_data);
     println!("gas used: {:?}", gas - call_result.gas_left);
@@ -135,12 +137,12 @@ fn run_call(args: Args) {
         params.code = Some(Arc::new(code.clone()));
         params.data = calldata.clone();
 
-        let spec = ethcore::ethereum::new_constantinople_test();
-        let mut test_client = ethcore::client::EvmTestClient::new(&spec).unwrap();
+        let spec = spec::new_constantinople_test();
+        let mut test_client = EvmTestClient::new(&spec).unwrap();
 
         let start_run = Instant::now();
 
-        let _result = test_client.call(params, &mut ethcore::trace::NoopTracer, &mut ethcore::trace::NoopVMTracer).unwrap();
+        let _result = test_client.call(params, &mut trace::NoopTracer, &mut trace::NoopVMTracer).unwrap();
 
         let run_duration = start_run.elapsed();
         total_duration = total_duration + run_duration;
@@ -161,12 +163,9 @@ struct Args {
 	flag_from: Option<String>,
 	flag_to: Option<String>,
 	flag_code: Option<String>,
-	flag_to: Option<String>,
-	flag_from: Option<String>,
 	flag_input: Option<String>,
 	flag_gas: Option<String>,
 	flag_gas_price: Option<String>,
-	flag_input: Option<String>,
     flag_expected: Option<String>,
 }
 

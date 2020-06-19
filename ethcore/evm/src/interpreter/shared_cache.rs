@@ -15,6 +15,7 @@
 // along with Open Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::sync::Arc;
+use std::mem;
 use hash::KECCAK_EMPTY;
 use parity_util_mem::{MallocSizeOf, MallocSizeOfOps};
 use ethereum_types::H256;
@@ -41,7 +42,9 @@ impl MallocSizeOf for Bits {
 struct CacheItem {
 	jump_destination: Bits,
 	sub_entrypoint: Bits,
+	sub_length: SubLengths,
 }
+
 /// Global cache for EVM interpreter
 pub struct SharedCache {
 	jump_destinations: Mutex<MemoryLruCache<H256, CacheItem>>,
@@ -57,15 +60,15 @@ impl SharedCache {
 	}
 
 	/// Get jump destinations bitmap for a contract.
-	pub fn jump_and_sub_destinations(&self, code_hash: &Option<H256>, code: &[u8]) -> (Arc<BitSet>, Arc<BitSet>) {
+	pub fn jump_and_sub_destinations(&self, code_hash: &Option<H256>, code: &[u8]) -> (Arc<BitSet>, Arc<BitSet>, Arc<SubLengthBits>) {
 		if let Some(ref code_hash) = code_hash {
 			if code_hash == &KECCAK_EMPTY {
 				let cache_item = Self::find_jump_and_sub_destinations(code);
-				return (cache_item.jump_destination.0, cache_item.sub_entrypoint.0);
+				return (cache_item.jump_destination.0, cache_item.sub_entrypoint.0, cache_item.sub_length.0);
 			}
 
 			if let Some(d) = self.jump_destinations.lock().get_mut(code_hash) {
-				return (d.jump_destination.0.clone(), d.sub_entrypoint.0.clone());
+				return (d.jump_destination.0.clone(), d.sub_entrypoint.0.clone(), d.sub_length.0.clone());
 			}
 		}
 
@@ -75,13 +78,17 @@ impl SharedCache {
 			self.jump_destinations.lock().insert(*code_hash, d.clone());
 		}
 
-		(d.jump_destination.0, d.sub_entrypoint.0)
+		(d.jump_destination.0, d.sub_entrypoint.0, d.sub_length.0)
 	}
 
 	fn find_jump_and_sub_destinations(code: &[u8]) -> CacheItem {
 		let mut jump_dests = BitSet::with_capacity(code.len());
 		let mut sub_entrypoints = BitSet::with_capacity(code.len());
+		let mut sub_lengths = SubLengthBits::new(code);
 		let mut position = 0;
+		let mut sub_start = 0;
+
+		// TODO special case when first opcode is BEGINSUB
 
 		while position < code.len() {
 			let instruction = Instruction::from_u8(code[position]);
@@ -89,21 +96,31 @@ impl SharedCache {
 			if let Some(instruction) = instruction {
 				match instruction {
 					instructions::JUMPDEST => { jump_dests.insert(position); },
-					instructions::BEGINSUB => { sub_entrypoints.insert(position); },
+					instructions::BEGINSUB => {
+						sub_entrypoints.insert(position);
+						sub_lengths.store(sub_start, position - sub_start);
+						sub_start = position;
+					},
 					_ => {
 						if let Some(push_bytes) = instruction.push_bytes() {
 							position += push_bytes;
 						}
-					},	
+					},
 				}
 			}
 			position += 1;
 		}
 
+		sub_lengths.store(sub_start, position - sub_start);
+
 		jump_dests.shrink_to_fit();
+		sub_entrypoints.shrink_to_fit();
+		sub_lengths.0.shrink_to_fit();
+
 		CacheItem {
 			jump_destination: Bits(Arc::new(jump_dests)),
 			sub_entrypoint: Bits(Arc::new(sub_entrypoints)),
+			sub_length: SubLengths(Arc::new(sub_lengths)),
 		}
 	}
 }
@@ -113,6 +130,48 @@ impl Default for SharedCache {
 		SharedCache::new(DEFAULT_CACHE_SIZE)
 	}
 }
+
+#[derive(Clone)]
+pub struct SubLengthBits(BitSet);
+
+impl SubLengthBits {
+	pub fn new(code: &[u8]) -> Self {
+		SubLengthBits(BitSet::with_capacity(code.len()))
+	}
+
+	fn store(&mut self, sub_start: usize, sub_length: usize) {
+		let mut l = sub_length;
+		let mut bit = sub_start;
+		while l > 0 {
+			if l & 1 == 1 { self.0.insert(bit); }
+			bit += 1;
+			l >>= 1;
+		}
+	}
+
+	pub fn find_length(&self, sub_start: usize, begin_subs: &BitSet) -> usize {
+		let mut length = self.0.contains(sub_start) as usize;
+		let mut bit:usize = 0;
+
+		while bit < (mem::size_of::<usize>() * 8 - 1) &&
+			sub_start + length < begin_subs.capacity() &&
+			!begin_subs.contains(sub_start + length) {
+			bit += 1;
+			length |= (self.0.contains(sub_start + bit) as usize) << bit;
+		}
+		length
+	}
+}
+
+impl MallocSizeOf for SubLengths {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        // dealing in bits here
+        (self.0).0.capacity() * 8
+    }
+}
+
+#[derive(Clone)]
+struct SubLengths(Arc<SubLengthBits>);
 
 #[test]
 fn test_find_jump_destinations() {
@@ -130,8 +189,9 @@ fn test_find_jump_destinations() {
 	let cache_item = SharedCache::find_jump_and_sub_destinations(&code);
 
 	// then
-	assert!(cache_item.jump_destination.0.iter().eq(vec![66].into_iter()));
+	assert!(cache_item.jump_destination.0.iter().eq(vec![0x42].into_iter()));
 	assert!(cache_item.sub_entrypoint.0.is_empty());
+	//assert!(cache_item.sub_length.0.iter().eq(vec![].into_iter()));
 }
 
 #[test]
@@ -140,11 +200,11 @@ fn test_find_jump_destinations_not_in_data_segments() {
 
 	// 0000 60 06   PUSH1 06
 	// 0002 56      JUMP
-	// 0003 50 5B   PUSH1 0x5B	
+	// 0003 50 5B   PUSH1 0x5B
 	// 0005 56      STOP
 	// 0006 5B      JUMPDEST
 	// 0007 60 04   PUSH1 04
-	// 0009 56      JUMP	
+	// 0009 56      JUMP
 	let code = hex!("600656605B565B6004");
 
 	// when
@@ -177,7 +237,7 @@ fn test_find_jump_and_sub_allowing_unknown_opcodes() {
 
 	// given
 
-	// 0000 5B   JUMPDEST       
+	// 0000 5B   JUMPDEST
 	// 0001 CC   ???
 	// 0002 B2   BEGINSUB
 	let code = hex!("5BCC5C");

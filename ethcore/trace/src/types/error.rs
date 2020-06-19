@@ -60,6 +60,7 @@ impl<'a> From<&'a VmError> for Error {
 		match *e {
 			VmError::OutOfGas => Error::OutOfGas,
 			VmError::BadJumpDestination { .. } => Error::BadJumpDestination,
+			VmError::BadJumpSubDestination { .. } => Error::BadJumpDestination,
 			VmError::BadInstruction { .. } => Error::BadInstruction,
 			VmError::StackUnderflow { .. } => Error::StackUnderflow,
 			VmError::OutOfStack { .. } => Error::OutOfStack,

@@ -48,6 +48,10 @@ pub enum Error {
 		/// Position the code tried to jump to.
 		destination: usize
 	},
+	BadJumpSubDestination {
+		/// Position the code tried to jumpsub to.
+		destination: usize
+	},
 	/// `BadInstructions` is returned when given instruction is not supported
 	BadInstruction {
 		/// Unrecognized opcode
@@ -119,6 +123,7 @@ impl fmt::Display for Error {
 		match *self {
 			OutOfGas => write!(f, "Out of gas"),
 			BadJumpDestination { destination } => write!(f, "Bad jump destination {:x} (trimmed to usize)", destination),
+			BadJumpSubDestination { destination } => write!(f, "Bad jumo into subroutine destination {:x} (trimmed to usize)", destination),
 			BadInstruction { instruction } => write!(f, "Bad instruction {:x}",  instruction),
 			StackUnderflow { instruction, wanted, on_stack } => write!(f, "Stack underflow {} {}/{}", instruction, wanted, on_stack),
 			OutOfStack { instruction, wanted, limit } => write!(f, "Out of stack {} {}/{}", instruction, wanted, limit),

@@ -349,6 +349,7 @@ impl<'a> CallCreateExecutive<'a> {
 		match *result {
 			Err(vm::Error::OutOfGas)
 				| Err(vm::Error::BadJumpDestination {..})
+				| Err(vm::Error::BadJumpSubDestination {..})
 				| Err(vm::Error::BadInstruction {.. })
 				| Err(vm::Error::StackUnderflow {..})
 				| Err(vm::Error::BuiltIn {..})

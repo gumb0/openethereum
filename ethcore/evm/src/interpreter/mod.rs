@@ -44,6 +44,7 @@ use self::gasometer::Gasometer;
 use self::stack::{Stack, VecStack};
 use self::memory::Memory;
 pub use self::shared_cache::SharedCache;
+use self::shared_cache::SubLengthBits;
 
 use bit_set::BitSet;
 
@@ -99,7 +100,7 @@ enum InstructionResult<Gas> {
 	UnusedGas(Gas),
 	JumpToPosition(U256),
 	JumpToSubroutine(U256),
-	ReturnFromSubroutine(usize),
+	ReturnFromSubroutine((usize, usize)),
 	StopExecutionNeedsReturn {
 		/// Gas left.
 		gas: Gas,
@@ -186,9 +187,11 @@ pub struct Interpreter<Cost: CostType> {
 	done: bool,
 	valid_jump_destinations: Option<Arc<BitSet>>,
 	valid_subroutine_destinations: Option<Arc<BitSet>>,
+	subroutine_lengths: Option<Arc<SubLengthBits>>,
+	current_subroutine_start: usize,
 	gasometer: Option<Gasometer<Cost>>,
 	stack: VecStack<U256>,
-	return_stack: Vec<usize>,
+	return_stack: Vec<(usize, usize)>,
 	resume_output_range: Option<(U256, U256)>,
 	resume_result: Option<InstructionResult<Cost>>,
 	last_stack_ret_len: usize,
@@ -280,17 +283,19 @@ impl<Cost: CostType> Interpreter<Cost> {
 		let informant = informant::EvmInformant::new(depth);
 		let valid_jump_destinations = None;
 		let valid_subroutine_destinations = None;
+		let subroutine_lengths = None;
 		let gasometer = Cost::from_u256(params.gas).ok().map(|gas| Gasometer::<Cost>::new(gas));
 		let stack = VecStack::with_capacity(schedule.stack_limit, U256::zero());
 		let return_stack = Vec::with_capacity(MAX_SUB_STACK_SIZE);
 		Interpreter {
 			cache, params, reader, informant,
-			valid_jump_destinations, valid_subroutine_destinations,
+			valid_jump_destinations, valid_subroutine_destinations, subroutine_lengths,
 			gasometer, stack, return_stack,
 			done: false,
 			// Overridden in `step_inner` based on
 			// the result of `ext.trace_next_instruction`.
 			do_trace: true,
+            current_subroutine_start: 0,
 			mem: Vec::new(),
 			return_data: ReturnData::empty(),
 			last_stack_ret_len: 0,
@@ -414,9 +419,15 @@ impl<Cost: CostType> Interpreter<Cost> {
 			InstructionResult::JumpToPosition(position) => {
 				if self.valid_jump_destinations.is_none() {
 					self.valid_jump_destinations = Some(self.cache.jump_and_sub_destinations(&self.params.code_hash, &self.reader.code).0);
+					self.subroutine_lengths = Some(self.cache.jump_and_sub_destinations(&self.params.code_hash, &self.reader.code).2);
 				}
+                if self.valid_subroutine_destinations.is_none() {
+                    self.valid_subroutine_destinations = Some(self.cache.jump_and_sub_destinations(&self.params.code_hash, &self.reader.code).1);
+                }
 				let jump_destinations = self.valid_jump_destinations.as_ref().expect("jump_destinations are initialized on first jump; qed");
-				let pos = match self.verify_jump(position, jump_destinations) {
+                let subroutine_destinations = self.valid_subroutine_destinations.as_ref().expect("subroutine_destinations are initialized on first jump; qed");
+				let subroutine_lengths = self.subroutine_lengths.as_ref().expect("subroutine_lengths are initialized on first jump; qed");
+				let pos = match self.verify_jump(position, jump_destinations, subroutine_destinations, subroutine_lengths) {
 					Ok(x) => x,
 					Err(e) => return InterpreterResult::Done(Err(e))
 				};
@@ -427,15 +438,18 @@ impl<Cost: CostType> Interpreter<Cost> {
 					self.valid_subroutine_destinations = Some(self.cache.jump_and_sub_destinations(&self.params.code_hash, &self.reader.code).1);
 				}
 				let subroutine_destinations = self.valid_subroutine_destinations.as_ref().expect("subroutine_destinations are initialized on first jump; qed");
-				let pos = match self.verify_jump(position, subroutine_destinations) {
+				let pos = match self.verify_jumpsub(position, subroutine_destinations) {
 					Ok(x) => x,
 					Err(e) => return InterpreterResult::Done(Err(e))
 				};
-				self.return_stack.push(self.reader.position);
+				// TODO push sub_start, too
+				self.return_stack.push((self.reader.position, self.current_subroutine_start));
+                self.current_subroutine_start = pos;
 				self.reader.position = pos + 1;
-			},	
+			},
 			InstructionResult::ReturnFromSubroutine(pos) => {
-				self.reader.position = pos;
+				self.reader.position = pos.0;
+                self.current_subroutine_start = pos.1;
 			},
 			InstructionResult::StopExecutionNeedsReturn {gas, init_off, init_size, apply} => {
 				let mem = mem::replace(&mut self.mem, Vec::new());
@@ -1224,10 +1238,13 @@ impl<Cost: CostType> Interpreter<Cost> {
 		}
 	}
 
-	fn verify_jump(&self, jump_u: U256, valid_jump_destinations: &BitSet) -> vm::Result<usize> {
+	fn verify_jump(&self, jump_u: U256, valid_jump_destinations: &BitSet, valid_subroutine_destinations: &BitSet, subroutines_lengths: &SubLengthBits) -> vm::Result<usize> {
 		let jump = jump_u.low_u64() as usize;
 
-		if valid_jump_destinations.contains(jump) && U256::from(jump) == jump_u {
+		if valid_jump_destinations.contains(jump) &&
+			jump >= self.current_subroutine_start &&
+			jump < self.current_subroutine_start + subroutines_lengths.find_length(self.current_subroutine_start, &valid_subroutine_destinations) &&
+			U256::from(jump) == jump_u {
 			Ok(jump)
 		} else {
 			// Note: if jump > usize, BadJumpDestination value is trimmed
@@ -1237,7 +1254,20 @@ impl<Cost: CostType> Interpreter<Cost> {
 		}
 	}
 
-	fn bool_to_u256(val: bool) -> U256 {
+    fn verify_jumpsub(&self, jump_u: U256, valid_subroutine_destinations: &BitSet) -> vm::Result<usize> {
+        let jump = jump_u.low_u64() as usize;
+
+        if valid_subroutine_destinations.contains(jump) && U256::from(jump) == jump_u {
+            Ok(jump)
+        } else {
+            // Note: if jump > usize, BadJumpDestination value is trimmed
+            Err(vm::Error::BadJumpSubDestination {
+                destination: jump
+            })
+        }
+    }
+
+    fn bool_to_u256(val: bool) -> U256 {
 		if val {
 			U256::one()
 		} else {

@@ -838,7 +838,7 @@ fn test_subs_invalid_jump(factory: super::Factory) {
 		test_finalize(vm.exec(&mut ext).ok().unwrap())
 	};
 
-	let expected = Result::Err(vm::Error::BadJumpDestination{ destination: 0xc });
+	let expected = Result::Err(vm::Error::BadJumpSubDestination{ destination: 0xc });
 	assert_eq!(current, expected);
 }
 
@@ -885,12 +885,13 @@ fn test_subs_substack_limit(factory: super::Factory) {
 	params.code = Some(Arc::new(code));
 	let mut ext = FakeExt::new_berlin();
 
-	let gas_left = {
+	let current = {
 		let vm = factory.create(params, ext.schedule(), ext.depth());
-		test_finalize(vm.exec(&mut ext).ok().unwrap()).unwrap()
+		test_finalize(vm.exec(&mut ext).ok().unwrap())
 	};
 
-	assert_eq!(gas_left, U256::from(959_049));
+	let expected = Result::Err(vm::Error::BadJumpDestination{ destination: 7 });
+	assert_eq!(current, expected);
 }
 
 evm_test!{test_subs_substack_out: test_subs_substack_out_int}
@@ -908,7 +909,7 @@ fn test_subs_substack_out(factory: super::Factory) {
 		test_finalize(vm.exec(&mut ext).ok().unwrap())
 	};
 
-	let expected = Result::Err(vm::Error::OutOfSubStack{ wanted:1, limit: MAX_SUB_STACK_SIZE });
+	let expected = Result::Err(vm::Error::BadJumpDestination{ destination: 7 });
 	assert_eq!(current, expected);
 }
 
@@ -921,12 +922,13 @@ fn test_subs_sub_at_end(factory: super::Factory) {
 	params.code = Some(Arc::new(code));
 	let mut ext = FakeExt::new_berlin();
 
-	let gas_left = {
+	let current = {
 		let vm = factory.create(params, ext.schedule(), ext.depth());
-		test_finalize(vm.exec(&mut ext).ok().unwrap()).unwrap()
+		test_finalize(vm.exec(&mut ext).ok().unwrap())
 	};
 
-	assert_eq!(gas_left, U256::from(0));
+	let expected = Result::Err(vm::Error::BadJumpDestination{destination: 5});
+	assert_eq!(current, expected);
 }
 
 evm_test!{test_subs_walk_into_subroutine: test_subs_walk_into_subroutine_int}
@@ -946,6 +948,144 @@ fn test_subs_walk_into_subroutine(factory: super::Factory) {
 	let expected = Result::Err(vm::Error::InvalidSubEntry);
 	assert_eq!(current, expected);
 }
+
+evm_test!{test_jump_accross_subs: test_jump_accross_subs_int}
+fn test_jump_accross_subs(factory: super::Factory) {
+	// test from https://github.com/ethereum/EIPs/pull/2663
+	// PUSH1 4 JUMP BEGINSUB JUMPDEST
+	let code = hex!("6004565c5b").to_vec();
+
+	let mut params = ActionParams::default();
+	params.gas = U256::from(100);
+	params.code = Some(Arc::new(code));
+	let mut ext = FakeExt::new_berlin();
+
+	let current = {
+		let vm = factory.create(params, ext.schedule(), ext.depth());
+		test_finalize(vm.exec(&mut ext).ok().unwrap())
+	};
+
+	let expected = Result::Err(vm::Error::BadJumpDestination{destination: 4});
+	assert_eq!(current, expected);
+}
+
+evm_test!{test_jumps_inside_subroutine: test_jumps_inside_subroutine_int}
+fn test_jumps_inside_subroutine(factory: super::Factory) {
+	//     PUSH1
+	//     L1
+	//     JUMP
+	//     INVALID
+	// L1: JUMPDEST
+	//     PUSH
+	//     S1
+	//     JUMPSUB
+	//     PUSH1
+	//     L2
+	//     JUMP
+	//     INVALID
+	// L2: JUMPDEST
+	//     STOP
+	// S1: BEGINSUB
+	//     PUSH1
+	//     L3
+	//     JUMP
+	//     INVALID
+	// L3: JUMPDEST
+	//     RETURNSUB
+	let code = hex!("600456fe5b600e5e600c56fe5b005c601356fe5b5d").to_vec();
+
+	let mut params = ActionParams::default();
+	params.gas = U256::from(100);
+	params.code = Some(Arc::new(code));
+	let mut ext = FakeExt::new_berlin();
+
+	let gas_left = {
+		let vm = factory.create(params, ext.schedule(), ext.depth());
+		test_finalize(vm.exec(&mut ext).ok().unwrap()).unwrap()
+	};
+
+	// TODO check gas
+	assert_eq!(gas_left, U256::from(46));
+}
+
+evm_test!{test_jump_to_beginsub1: test_jump_to_beginsub1_int}
+fn test_jump_to_beginsub1(factory: super::Factory) {
+	//     PUSH1
+	//     S1
+	//     JUMPSUB
+	//     INVALID
+	//     STOP
+	// S1: BEGINSUB // 05
+	//     PUSH1
+	//     L1
+	//     JUMP
+	//     INVALID
+	//     RETURNSUB
+	// L1: BEGINSUB // 0b
+	let code = hex!("60055efe005c600b56fe5d5c").to_vec();
+
+	let mut params = ActionParams::default();
+	params.gas = U256::from(100);
+	params.code = Some(Arc::new(code));
+	let mut ext = FakeExt::new_berlin();
+
+	let current = {
+		let vm = factory.create(params, ext.schedule(), ext.depth());
+		test_finalize(vm.exec(&mut ext).ok().unwrap())
+	};
+
+	let expected = Result::Err(vm::Error::BadJumpDestination{destination: 0x0b});
+	assert_eq!(current, expected);
+}
+
+evm_test!{test_jump_to_beginsub2: test_jump_to_beginsub2_int}
+fn test_jump_to_beginsub2(factory: super::Factory) {
+	//     PUSH1
+	//     S1
+	//     JUMPSUB
+	//     INVALID
+	//     STOP
+	// S1: BEGINSUB // 05
+	//     PUSH1
+	//     S1
+	//     JUMP
+	//     INVALID
+	//     RETURNSUB
+	let code = hex!("60055efe005c600556fe5d").to_vec();
+
+	let mut params = ActionParams::default();
+	params.gas = U256::from(100);
+	params.code = Some(Arc::new(code));
+	let mut ext = FakeExt::new_berlin();
+
+	let current = {
+		let vm = factory.create(params, ext.schedule(), ext.depth());
+		test_finalize(vm.exec(&mut ext).ok().unwrap())
+	};
+
+	let expected = Result::Err(vm::Error::BadJumpDestination{destination: 0x05});
+	assert_eq!(current, expected);
+}
+
+evm_test!{test_beginsub_at_start: test_beginsub_at_start_int}
+fn test_beginsub_at_start(factory: super::Factory) {
+	// BEGINSUB BEGINSUB BEGINSUB
+	let code = hex!("5c5c5c").to_vec();
+
+	let mut params = ActionParams::default();
+	params.gas = U256::from(100);
+	params.code = Some(Arc::new(code));
+	let mut ext = FakeExt::new_berlin();
+
+	let current = {
+		let vm = factory.create(params, ext.schedule(), ext.depth());
+		test_finalize(vm.exec(&mut ext).ok().unwrap())
+	};
+
+	let expected = Result::Err(vm::Error::InvalidSubEntry);
+	assert_eq!(current, expected);
+}
+
 
 evm_test!{test_calls: test_calls_int}
 fn test_calls(factory: super::Factory) {
